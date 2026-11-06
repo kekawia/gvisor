@@ -55,7 +55,7 @@ func (c *rtoRecoveryClock) AfterFunc(d time.Duration, f func()) tcpip.Timer {
 }
 
 func TestRTORecoveryDrainsLostWindow(t *testing.T) {
-	for _, mode := range []string{"rack", "sack", "rack_reordered", "rack_timer"} {
+	for _, mode := range []string{"rack", "sack", "rack_reordered", "rack_timer", "rack_lost"} {
 		t.Run(mode, func(t *testing.T) {
 			const (
 				advertisedMSS = 1460
@@ -201,18 +201,24 @@ func TestRTORecoveryDrainsLostWindow(t *testing.T) {
 				if received < tcp.InitialCwnd*mss {
 					checkRecovery()
 				}
-				if (mode == "rack_reordered" || mode == "rack_timer") && received == mss {
-					// Hold the second retransmission while SACKing the third.
+				if (mode == "rack_reordered" || mode == "rack_timer" || mode == "rack_lost") && received == mss {
+					// Hold the second retransmission while SACKing the third. In
+					// the last two modes the SACK comes late enough to prove that
+					// the second retransmission was lost.
 					readSegment(mss)
 					readSegment(2 * mss)
-					if mode == "rack_timer" {
+					if mode != "rack_reordered" {
 						clock.Advance(10 * time.Millisecond)
+					}
+					if mode == "rack_timer" {
 						clock.watch <- struct{}{}
 					}
-					ack(received, []header.SACKBlock{{
+					before := info()
+					sacks := []header.SACKBlock{{
 						Start: c.IRS.Add(1 + seqnum.Size(2*mss)),
 						End:   c.IRS.Add(1 + seqnum.Size(3*mss)),
-					}})
+					}}
+					ack(received, sacks)
 					checkRecovery()
 					if mode == "rack_timer" {
 						var delay time.Duration
@@ -227,7 +233,37 @@ func TestRTORecoveryDrainsLostWindow(t *testing.T) {
 						default:
 							t.Fatal("reordering timer did not fire")
 						}
+					}
+					if mode != "rack_reordered" {
+						// Replace the lost copy without another congestion response.
+						readSegment(mss)
 						checkRecovery()
+						if after := info(); after.SndCwnd != before.SndCwnd || after.SndSsthresh != before.SndSsthresh {
+							t.Fatalf("after replacing the lost retransmission: cwnd, ssthresh = %d, %d, want %d, %d",
+								after.SndCwnd, after.SndSsthresh, before.SndCwnd, before.SndSsthresh)
+						}
+					}
+					if mode == "rack_lost" {
+						// Repeating the SACK reports no new delivery.
+						ack(received, sacks)
+						if packet := c.GetPacketNonBlocking(); packet != nil {
+							packet.Release()
+							t.Fatal("repeated SACK sent another segment")
+						}
+						// The replacement gets a full RTO. This crosses the deadline
+						// that was armed before it was sent.
+						clock.Advance(info().RTO - 5*time.Millisecond)
+						if got := c.Stack().Stats().TCP.Timeouts.Value(); got != 1 {
+							t.Fatalf("timeouts after replacing the lost retransmission = %d, want 1", got)
+						}
+						// The replacement took over the lost copy's charge, so
+						// this ACK leaves room for two new segments.
+						ack(3*mss, nil)
+						checkRecovery()
+						readSegment(3 * mss)
+						readSegment(4 * mss)
+						received = 5 * mss
+						continue
 					}
 					received = 3 * mss
 					continue

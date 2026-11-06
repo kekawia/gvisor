@@ -444,14 +444,14 @@ func (rc *rackControl) reorderTimerExpired() tcpip.Error {
 	// (gvisor#9707/#9778). detectLoss arms the timer from rcvdTime-derived
 	// values, so evaluating it at the timer target keeps the two consistent.
 	numLost := rc.detectLoss(rc.snd.reorderTimer.target)
-	// A reordering timer must not start fast recovery while timeout recovery
-	// is still draining the pre-RTO flight. See sender.detectLoss.
-	if numLost == 0 || rc.snd.state == tcpip.RTORecovery {
+	if numLost == 0 {
 		return nil
 	}
 
 	fastRetransmit := false
-	if !rc.snd.FastRecovery.Active {
+	// A reordering timer must not start fast recovery while timeout recovery
+	// is still draining the pre-RTO flight. See sender.detectLoss.
+	if !rc.snd.FastRecovery.Active && rc.snd.state != tcpip.RTORecovery {
 		rc.snd.cc.HandleLossDetected()
 		rc.snd.enterRecovery()
 		fastRetransmit = true
@@ -470,6 +470,11 @@ func (rc *rackControl) DoRecovery(_ *segment, fastRetransmit bool) {
 	if fastRetransmit {
 		snd.resendSegment()
 	}
+
+	// During timeout recovery, every segment before writeNext was sent after
+	// the RTO and charged to Outstanding. A replacement takes over the charge
+	// of the copy that was lost, so it needs no room in the window.
+	replacing := snd.state == tcpip.RTORecovery
 
 	var dataSent bool
 	// Iterate the writeList and retransmit the segments which are marked
@@ -490,7 +495,7 @@ func (rc *rackControl) DoRecovery(_ *segment, fastRetransmit bool) {
 		}
 
 		// Check the congestion window after entering recovery.
-		if snd.Outstanding >= snd.SndCwnd {
+		if !replacing && snd.Outstanding >= snd.SndCwnd {
 			break
 		}
 
@@ -498,7 +503,9 @@ func (rc *rackControl) DoRecovery(_ *segment, fastRetransmit bool) {
 			break
 		}
 		dataSent = true
-		snd.Outstanding += snd.pCount(seg, snd.MaxPayloadSize)
+		if !replacing {
+			snd.Outstanding += snd.pCount(seg, snd.MaxPayloadSize)
+		}
 	}
 
 	snd.postXmit(dataSent, true /* shouldScheduleProbe */)

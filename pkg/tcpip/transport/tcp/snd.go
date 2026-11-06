@@ -1303,10 +1303,10 @@ func (s *sender) detectLoss(seg *segment) (fastRetransmit bool) {
 
 	// Preserve timeout recovery until the pre-RTO flight is acknowledged, so
 	// that its losses get one congestion response. In particular, a duplicate
-	// ACK must not change the state to Disorder. A retransmission lost in this
-	// state waits for the next RTO. See RFC 6582, section 3.2, steps 2 and 4;
-	// RFC 8985, section 9.3; and, for an RTO during loss recovery, RFC 6675,
-	// section 5.1.
+	// ACK must not change the state to Disorder. RACK replaces a retransmission
+	// lost in this state without another response. See RFC 6582, section 3.2,
+	// steps 2 and 4; RFC 8985, section 9.3; and, for an RTO during loss
+	// recovery, RFC 6675, section 5.1.
 	if s.state == tcpip.RTORecovery {
 		return false
 	}
@@ -1820,7 +1820,8 @@ func (s *sender) handleRcvdSegment(rcvdSeg *segment) {
 		// reorder window.
 		// Do not start fast recovery while timeout recovery is still draining
 		// the pre-RTO flight. See sender.detectLoss.
-		if numLost := s.rc.detectLoss(rcvdSeg.rcvdTime); numLost > 0 && !s.FastRecovery.Active && s.state != tcpip.RTORecovery {
+		numLost := s.rc.detectLoss(rcvdSeg.rcvdTime)
+		if numLost > 0 && !s.FastRecovery.Active && s.state != tcpip.RTORecovery {
 			// If any segment is marked as lost by
 			// RACK, enter recovery and retransmit
 			// the lost segments.
@@ -1829,7 +1830,7 @@ func (s *sender) handleRcvdSegment(rcvdSeg *segment) {
 			fastRetransmit = true
 		}
 
-		if s.FastRecovery.Active {
+		if s.FastRecovery.Active || (numLost > 0 && s.state == tcpip.RTORecovery) {
 			s.rc.DoRecovery(nil, fastRetransmit)
 		}
 	}
@@ -1879,7 +1880,7 @@ func (s *sender) sendSegment(seg *segment) tcpip.Error {
 			if !s.resendTimer.enabled() {
 				s.resendTimer.enable(s.RTO)
 			}
-		case s.FastRecovery.Active && s.ep.SACKPermitted && seg.xmitCount > 1 && seg == s.writeList.Front():
+		case (s.FastRecovery.Active || s.state == tcpip.RTORecovery) && s.ep.SACKPermitted && seg.xmitCount > 1 && seg == s.writeList.Front():
 			// Allow a full RTO after retransmitting the oldest outstanding
 			// data (RFC 6298, section 5). Retransmitting later holes in SACK
 			// recovery must not postpone the oldest segment's deadline.
